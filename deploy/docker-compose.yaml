@@ -1,0 +1,98 @@
+services:
+  installment-service:
+    image: finflow/installment-service:local
+    build:
+      context: ..
+      dockerfile: cmd/installment-service/Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      HTTP_ADDR: ":8080"
+      DATABASE_URL: postgres://finflow:${POSTGRES_PASSWORD:-finflow}@postgres:5432/installment_db?sslmode=disable
+      AMQP_URL: amqp://finflow:${RABBITMQ_PASSWORD:-finflow}@rabbitmq:5672/finflow
+    # env_file:
+    #   - ../.env
+    restart: unless-stopped
+    depends_on:
+      pg:
+        condition: service_healthy
+      mq:
+        condition: service_healthy
+
+  credit-limit-service:
+    image: finflow/credit-limit-service:local
+    build:
+      context: ..
+      dockerfile: cmd/credit-limit-service/Dockerfile
+    ports:
+      - "8081:8081"
+    environment:
+      HTTP_ADDR: ":8081"
+      DATABASE_URL: postgres://finflow:${POSTGRES_PASSWORD:-finflow}@postgres:5432/credit_db?sslmode=disable
+      AMQP_URL: amqp://finflow:${RABBITMQ_PASSWORD:-finflow}@rabbitmq:5672/finflow
+    # env_file:
+    #   - ../.env
+    restart: unless-stopped
+    depends_on:
+      pg:
+        condition: service_healthy
+      mq:
+        condition: service_healthy
+
+  merchant-service:
+    image: finflow/merchant-service:local
+    build:
+      context: ..
+      dockerfile: cmd/merchant-service/Dockerfile
+    environment:
+      DATABASE_URL: postgres://finflow:${POSTGRES_PASSWORD:-finflow}@postgres:5432/merchant_db?sslmode=disable
+      AMQP_URL: amqp://finflow:${RABBITMQ_PASSWORD:-finflow}@rabbitmq:5672/finflow
+    # env_file:
+    #   - ../.env
+    restart: unless-stopped
+    depends_on:
+      pg:
+        condition: service_healthy
+      mq:
+        condition: service_healthy
+  pg:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: finflow
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-finflow}
+      POSTGRES_DB: postgres
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $$POSTGRES_USER -d postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+  mq:
+    image: rabbitmq:4-management
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: finflow
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-finflow}
+      RABBITMQ_DEFAULT_VHOST: finflow
+    ports:
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD-SHELL", "rabbitmq-diagnostics -q check_running && rabbitmq-diagnostics -q check_port_connectivity"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  rabbitmq_data:

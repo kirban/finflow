@@ -1,0 +1,383 @@
+openapi: 3.0.3
+info:
+  title: FinFlow Installments API
+  version: 1.0.0
+  description: |
+    Демонстрационный BNPL API. Оформление рассрочки выполняется асинхронно
+    через оркестрируемую SAGA. Реальные переводы и погашение не выполняются.
+    Все суммы — целые числа в копейках RUB. API предназначен для локального стенда.
+servers:
+  - url: http://localhost:8080
+    description: Installment Service / SAGA Orchestrator
+tags:
+  - name: Installments
+  - name: Diagnostics
+paths:
+  /v1/installments:
+    post:
+      tags: [Installments]
+      operationId: createInstallment
+      summary: Принять заявку на рассрочку
+      description: |
+        Атомарно сохраняет заявку, ключ идемпотентности и первую команду в outbox.
+        Повтор с тем же ключом и тем же нормализованным телом возвращает исходный 202
+        и тот же идентификатор. Повтор с измененным телом или другой ключ для
+        того же merchantId + orderId возвращает 409, даже после отклонения заявки.
+        202 не означает успешное оформление. Клиент опрашивает Location.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            minLength: 8
+            maxLength: 128
+          example: 91fc770c-3caa-4b1f-a6f9-e709ee04c56a
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateInstallmentRequest'
+            example:
+              customerId: customer-demo
+              merchantId: merchant-ok
+              orderId: order-1001
+              amountMinor: 2000000
+              currency: RUB
+      responses:
+        '202':
+          description: Заявка принята и записана в БД
+          headers:
+            Location:
+              description: URL получения актуального состояния заявки
+              schema:
+                type: string
+              example: /v1/installments/78baa3f9-6fb5-48c7-9930-d100977a674a
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AcceptedInstallment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/installments/{installmentId}:
+    parameters:
+      - $ref: '#/components/parameters/InstallmentId'
+    get:
+      tags: [Installments]
+      operationId: getInstallment
+      summary: Получить статус рассрочки
+      responses:
+        '200':
+          description: Актуальное состояние заявки в базе оркестратора
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Installment'
+              examples:
+                approved:
+                  value:
+                    id: 78baa3f9-6fb5-48c7-9930-d100977a674a
+                    customerId: customer-demo
+                    merchantId: merchant-ok
+                    orderId: order-1001
+                    amountMinor: 2000000
+                    currency: RUB
+                    status: APPROVED
+                    paymentCount: 4
+                    createdAt: '2026-11-17T12:00:00Z'
+                    updatedAt: '2026-11-17T12:00:01Z'
+                rejected:
+                  value:
+                    id: b5e24a3d-15d0-4cf6-8709-d45bcdb390db
+                    customerId: customer-demo
+                    merchantId: merchant-reject
+                    orderId: order-1002
+                    amountMinor: 2000000
+                    currency: RUB
+                    status: REJECTED
+                    paymentCount: 4
+                    failureCode: MERCHANT_REJECTED
+                    createdAt: '2026-11-17T12:01:00Z'
+                    updatedAt: '2026-11-17T12:01:01Z'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/installments/{installmentId}/saga:
+    parameters:
+      - $ref: '#/components/parameters/InstallmentId'
+    get:
+      tags: [Diagnostics]
+      operationId: getInstallmentSaga
+      summary: Получить состояние и историю выполнения SAGA
+      description: История переходов оркестратора в порядке sequence. Не является журналом всех доставок брокера.
+      responses:
+        '200':
+          description: Состояние SAGA
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Saga'
+              example:
+                id: 78baa3f9-6fb5-48c7-9930-d100977a674a
+                status: APPROVED
+                currentStep: DONE
+                needsAttention: false
+                history:
+                  - sequence: 1
+                    step: RESERVE_LIMIT
+                    outcome: REQUESTED
+                    occurredAt: '2026-11-17T12:00:00Z'
+                  - sequence: 2
+                    step: RESERVE_LIMIT
+                    outcome: SUCCEEDED
+                    occurredAt: '2026-11-17T12:00:00Z'
+                  - sequence: 3
+                    step: CREATE_MERCHANT_OBLIGATION
+                    outcome: REQUESTED
+                    occurredAt: '2026-11-17T12:00:00Z'
+                  - sequence: 4
+                    step: CREATE_MERCHANT_OBLIGATION
+                    outcome: SUCCEEDED
+                    occurredAt: '2026-11-17T12:00:01Z'
+                  - sequence: 5
+                    step: ACTIVATE_INSTALLMENT
+                    outcome: SUCCEEDED
+                    occurredAt: '2026-11-17T12:00:01Z'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+  /v1/customers/{customerId}/limit:
+    servers:
+      - url: http://localhost:8081
+        description: Credit Limit Service (локальная диагностика)
+    parameters:
+      - name: customerId
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/ExternalId'
+    get:
+      tags: [Diagnostics]
+      operationId: getCustomerLimit
+      summary: Получить доступный и зарезервированный кредитный лимит
+      responses:
+        '200':
+          description: Состояние лимита на момент чтения из базы Credit Limit Service
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CustomerLimit'
+              example:
+                customerId: customer-demo
+                currency: RUB
+                totalMinor: 5000000
+                reservedMinor: 2000000
+                availableMinor: 3000000
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+components:
+  parameters:
+    InstallmentId:
+      name: installmentId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+  responses:
+    BadRequest:
+      description: Невалидный запрос, идентификатор или отсутствующий обязательный заголовок
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example: {code: VALIDATION_ERROR, message: Invalid request}
+    Conflict:
+      description: Конфликт ключа идемпотентности или магазин уже использовал orderId
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          examples:
+            idempotency:
+              value: {code: IDEMPOTENCY_CONFLICT, message: Key already used with a different request}
+            order:
+              value: {code: ORDER_ALREADY_EXISTS, message: Order already has an installment application}
+    NotFound:
+      description: Ресурс не найден
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example: {code: NOT_FOUND, message: Resource not found}
+    Unavailable:
+      description: Временная недоступность. Повтор POST выполняется с исходным ключом идемпотентности.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example: {code: SERVICE_UNAVAILABLE, message: Try again later}
+  schemas:
+    ExternalId:
+      type: string
+      minLength: 1
+      maxLength: 64
+      pattern: '^[a-zA-Z0-9_-]+$'
+    AmountMinor:
+      type: integer
+      format: int64
+      minimum: 4
+      maximum: 100000000
+      description: Сумма покупки в копейках; минимум 4 копейки для четырех платежей.
+      example: 2000000
+    Currency:
+      type: string
+      enum: [RUB]
+    CreateInstallmentRequest:
+      type: object
+      additionalProperties: false
+      required: [customerId, merchantId, orderId, amountMinor, currency]
+      properties:
+        customerId:
+          $ref: '#/components/schemas/ExternalId'
+        merchantId:
+          $ref: '#/components/schemas/ExternalId'
+        orderId:
+          $ref: '#/components/schemas/ExternalId'
+        amountMinor:
+          $ref: '#/components/schemas/AmountMinor'
+        currency:
+          $ref: '#/components/schemas/Currency'
+    AcceptedInstallment:
+      type: object
+      required: [id, statusUrl]
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: 78baa3f9-6fb5-48c7-9930-d100977a674a
+        statusUrl:
+          type: string
+          example: /v1/installments/78baa3f9-6fb5-48c7-9930-d100977a674a
+    InstallmentStatus:
+      type: string
+      enum: [PENDING, COMPENSATING, APPROVED, REJECTED]
+      description: APPROVED и REJECTED — терминальные состояния. REJECTED только после всех необходимых компенсаций.
+    FailureCode:
+      type: string
+      enum: [CUSTOMER_NOT_FOUND, INSUFFICIENT_LIMIT, MERCHANT_NOT_FOUND, MERCHANT_REJECTED, ACTIVATION_REJECTED]
+    Installment:
+      type: object
+      required: [id, customerId, merchantId, orderId, amountMinor, currency, status, paymentCount, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        customerId:
+          $ref: '#/components/schemas/ExternalId'
+        merchantId:
+          $ref: '#/components/schemas/ExternalId'
+        orderId:
+          $ref: '#/components/schemas/ExternalId'
+        amountMinor:
+          $ref: '#/components/schemas/AmountMinor'
+        currency:
+          $ref: '#/components/schemas/Currency'
+        status:
+          $ref: '#/components/schemas/InstallmentStatus'
+        paymentCount:
+          type: integer
+          enum: [4]
+        failureCode:
+          $ref: '#/components/schemas/FailureCode'
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+    SagaStep:
+      type: string
+      enum: [RESERVE_LIMIT, CREATE_MERCHANT_OBLIGATION, ACTIVATE_INSTALLMENT, CANCEL_MERCHANT_OBLIGATION, RELEASE_LIMIT, DONE]
+    SagaHistoryEntry:
+      type: object
+      required: [sequence, step, outcome, occurredAt]
+      properties:
+        sequence:
+          type: integer
+          format: int64
+          minimum: 1
+        step:
+          $ref: '#/components/schemas/SagaStep'
+        outcome:
+          type: string
+          enum: [REQUESTED, SUCCEEDED, REJECTED, RETRIED, ATTENTION_REQUIRED]
+        occurredAt:
+          type: string
+          format: date-time
+        failureCode:
+          $ref: '#/components/schemas/FailureCode'
+    Saga:
+      type: object
+      required: [id, status, currentStep, needsAttention, history]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Совпадает с идентификатором заявки в этом MVP.
+        status:
+          $ref: '#/components/schemas/InstallmentStatus'
+        currentStep:
+          $ref: '#/components/schemas/SagaStep'
+        needsAttention:
+          type: boolean
+          description: Превышен порог ожидания или требуется проверка доставки. Не является бизнес-отказом.
+        history:
+          type: array
+          items:
+            $ref: '#/components/schemas/SagaHistoryEntry'
+    CustomerLimit:
+      type: object
+      required: [customerId, currency, totalMinor, reservedMinor, availableMinor]
+      properties:
+        customerId:
+          $ref: '#/components/schemas/ExternalId'
+        currency:
+          $ref: '#/components/schemas/Currency'
+        totalMinor:
+          type: integer
+          format: int64
+          minimum: 0
+        reservedMinor:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Резервы незавершенных и активированных рассрочек. Погашение вне MVP.
+        availableMinor:
+          type: integer
+          format: int64
+          minimum: 0
+          description: totalMinor минус reservedMinor.
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+        message:
+          type: string
